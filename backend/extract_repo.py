@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 # Using absolute imports since we modified app.py to handle this
 from db import Repository, Author, Commit, File, Diff, Bug, Test
+from bug_detection import analyze_bug_fix
 
 def get_github_repo_info(repo_url):
     """Extract repository information from GitHub API"""
@@ -143,14 +144,28 @@ def extract_commits_from_repo_local(path):
 
 
 def extract_and_store(repo_url, session, repo_name=None):
+    # Clean and validate repo_url
+    repo_url = repo_url.strip()
+    if not (repo_url.startswith('http://') or repo_url.startswith('https://')):
+        raise RuntimeError(f"Invalid repository URL: {repo_url}")
+    if ' ' in repo_url:
+        raise RuntimeError(f"Repository URL contains spaces: {repo_url}")
+
     # Create temp dir in current working directory for better permissions
     tmpdir = os.path.join(os.getcwd(), 'tmp_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
+    # If temp dir exists, remove it to ensure a clean clone
+    if os.path.exists(tmpdir):
+        import shutil
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception as e:
+            print(f"[extract_repo] Failed to remove existing temp dir {tmpdir}: {e}")
     os.makedirs(tmpdir, exist_ok=True)
-    
+
     try:
         # Clone with specific git options for Windows compatibility
         repo = Repo.clone_from(
-            repo_url, 
+            repo_url,
             tmpdir,
             env={'GIT_CONFIG_PARAMETERS': "'core.longpaths=true'"},
             allow_unsafe_options=True
@@ -268,6 +283,31 @@ def extract_and_store(repo_url, session, repo_name=None):
             
             try:
                 session.commit()
+
+                # Analyze commit for bug fixes
+                if commit_obj.message:
+                    print('Analyzing commit:', commit_obj.hash[:7])
+                    print('Message:', commit_obj.message.split('\n')[0])
+                    
+                    # Get all diffs for this commit
+                    commit_diffs = [d for d in commit_obj.diffs]
+                    bug_info = analyze_bug_fix(commit_obj.message, commit_diffs)
+                    
+                    if bug_info:
+                        print(f"Found bug fix! Description: {bug_info['description']}")
+                        # Create new bug entry
+                        bug = Bug(
+                            description=bug_info['description'],
+                            fixed_commit=commit_obj.commit_id  # This is a fix commit
+                        )
+                        
+                        # Try to find the commit that introduced the bug
+                        # For now, we'll leave it as None but this could be enhanced
+                        # with more sophisticated bug origin analysis
+                        session.add(bug)
+                        session.commit()
+                        print("Bug entry saved to database")
+
             except Exception as e:
                 session.rollback()
                 print(f"Error processing commit {commit_hash}: {str(e)}")
@@ -304,7 +344,7 @@ def extract_and_store(repo_url, session, repo_name=None):
                 session.rollback()
                 print(f"Error processing diffs for commit {commit_hash}: {str(e)}")
                 continue
-
+ 
         summary = {
             'repo_url': repo_url,
             'commits_found': int(commits_df.shape[0]) if not commits_df.empty else 0,
